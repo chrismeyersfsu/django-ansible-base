@@ -35,10 +35,14 @@ LOGGING = {
             'formatter': 'simple',
             'filters': ['request_id_filter'],
         },
+        'otel': {
+            'class': 'ansible_base.lib.logging.handlers.otlp.local.file.WatchedFileHandler',
+            'filename': '/tmp/ansible_base.log',
+        }
     },
     'loggers': {
         'ansible_base': {
-            'handlers': ['console'],
+            'handlers': ['console', 'otel'],
             'level': 'DEBUG',
         },
         '': {
