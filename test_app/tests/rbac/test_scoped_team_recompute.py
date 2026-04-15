@@ -7,8 +7,9 @@ and team creation previously caused FK violations because the global
 recompute touched ObjectRoles from unrelated orgs.
 """
 
-import pytest
 from unittest.mock import patch
+
+import pytest
 
 from ansible_base.rbac.caching import (
     all_team_children,
