@@ -14,7 +14,6 @@ from ansible_base.rbac.caching import (
     all_team_children,
     compute_team_member_roles,
 )
-from ansible_base.rbac.models import ObjectRole, RoleDefinition, RoleEvaluation
 from ansible_base.rbac.permission_registry import permission_registry
 from test_app.models import Inventory, Organization
 
