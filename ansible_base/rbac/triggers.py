@@ -50,11 +50,7 @@ def _team_ids_from_role_target(object_role: 'ObjectRole') -> set[int]:
     if object_role.content_type_id == permission_registry.org_ct_id:
         parent_fd = permission_registry.get_parent_fd_name(permission_registry.team_model)
         if parent_fd:
-            return set(
-                permission_registry.team_model.objects.filter(
-                    **{f'{parent_fd}_id': int(object_role.object_id)}
-                ).values_list('id', flat=True)
-            )
+            return set(permission_registry.team_model.objects.filter(**{f'{parent_fd}_id': int(object_role.object_id)}).values_list('id', flat=True))
     return set()
 
 
@@ -284,9 +280,7 @@ def team_pre_delete(instance, *args, **kwargs):
     # After this team is deleted, those teams need their member_roles recomputed.
     # provides_teams tells us which teams these roles grant membership to.
     stashed_team_ids = set()
-    for object_role in ObjectRole.objects.filter(
-        teams=instance, role_definition__permissions__codename=permission_registry.team_permission
-    ):
+    for object_role in ObjectRole.objects.filter(teams=instance, role_definition__permissions__codename=permission_registry.team_permission):
         stashed_team_ids.update(object_role.provides_teams.values_list('id', flat=True))
     stashed_team_ids.discard(instance.id)  # the deleted team itself won't need recomputation
     instance.__rbac_stashed_recompute_team_ids = stashed_team_ids
