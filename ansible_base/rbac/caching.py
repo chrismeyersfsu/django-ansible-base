@@ -4,6 +4,7 @@ from typing import Optional
 from uuid import UUID
 
 from django.conf import settings
+from django.db import IntegrityError, transaction
 
 from ansible_base.rbac.models import ObjectRole, RoleDefinition, RoleEvaluation, RoleEvaluationUUID
 from ansible_base.rbac.permission_registry import permission_registry
@@ -45,6 +46,27 @@ def all_team_parents(team_id: int, team_team_parents: dict, seen: Optional[set] 
         seen.add(parent_id)
         parent_team_ids.update(all_team_parents(parent_id, team_team_parents, seen=seen))
     return parent_team_ids
+
+
+def all_team_children(team_id: int, team_team_children: dict, seen: Optional[set] = None) -> set[int]:
+    """
+    Returns child teams, and child teams of child teams, until we have them all.
+    Mirror of all_team_parents but traversing the reverse direction.
+
+    team_id: id of the team we want to get the direct and indirect children of
+    team_team_children: mapping of team id to ids of its children (reverse of team_team_parents)
+    seen: mutable set to prevent infinite recursion in the event of loops
+    """
+    child_team_ids = set()
+    if seen is None:
+        seen = set()
+    for child_id in team_team_children.get(team_id, []):
+        if child_id in seen:
+            continue
+        child_team_ids.add(child_id)
+        seen.add(child_id)
+        child_team_ids.update(all_team_children(child_id, team_team_children, seen=seen))
+    return child_team_ids
 
 
 def get_org_team_mapping() -> dict[int, list[int]]:
@@ -121,11 +143,66 @@ def get_parent_teams_of_teams(org_team_mapping: dict) -> dict[int, list[int]]:
     return team_team_parents
 
 
-def compute_team_member_roles():
+def _is_stale_objectrole_fk(exc):
+    """Return True if *exc* is specifically an FK violation from a stale ObjectRole reference.
+
+    PostgreSQL (psycopg2/psycopg3): checks SQLSTATE 23503 (foreign_key_violation)
+    and that the referenced table is ``dab_rbac_objectrole``.  Other
+    IntegrityError sub-types (unique-constraint, check-constraint, etc.) or FK
+    violations referencing a different table return False so they propagate
+    normally.
+
+    Other backends (SQLite): returns False.  The TOCTOU race requires truly
+    concurrent committed transactions, which SQLite's global write lock
+    prevents, so FK errors there indicate a real bug.
     """
-    Fills in the ObjectRole.provides_teams relationship for all teams.
-    This relationship is a list of teams that the role grants membership for
-    This method is always ran globally.
+    cause = exc.__cause__
+    if cause is None:
+        return False
+    # psycopg3 exposes .sqlstate, psycopg2 exposes .pgcode
+    sqlstate = getattr(cause, 'sqlstate', None) or getattr(cause, 'pgcode', None)
+    if sqlstate != '23503':
+        return False
+    return 'dab_rbac_objectrole' in str(cause)
+
+
+def _safe_m2m_add(team, to_add):
+    """Add ObjectRole IDs to team.member_roles, handling concurrent deletions.
+
+    A TOCTOU race exists: ObjectRole IDs collected during the read phase of
+    compute_team_member_roles() may be deleted by a concurrent transaction
+    (e.g. org deletion cascading through rbac_post_delete_remove_object_roles)
+    before this write.  The savepoint allows us to catch the FK violation
+    without aborting the outer transaction, then retry with only IDs that
+    still exist.
+    """
+    try:
+        with transaction.atomic():
+            team.member_roles.add(*to_add)
+    except IntegrityError as exc:
+        if not _is_stale_objectrole_fk(exc):
+            raise
+        to_add = set(ObjectRole.objects.filter(id__in=to_add).values_list('id', flat=True))
+        if to_add:
+            try:
+                with transaction.atomic():
+                    team.member_roles.add(*to_add)
+            except IntegrityError as exc:
+                if not _is_stale_objectrole_fk(exc):
+                    raise
+                logger.warning('Persistent IntegrityError adding member_roles for team %s, will be corrected on next recompute', team.id)
+
+
+def compute_team_member_roles(team_ids=None):
+    """
+    Fills in the ObjectRole.provides_teams relationship for teams.
+    This relationship is a list of teams that the role grants membership for.
+
+    Args:
+        team_ids: Optional iterable of team IDs to scope the write phase.
+            When provided, only those teams (plus their descendants in the
+            team-of-team graph) have their member_roles updated.
+            When None, all teams are updated (global recompute).
     """
     # Manually prefetch the team to org memberships
     org_team_mapping = get_org_team_mapping()
@@ -146,15 +223,29 @@ def compute_team_member_roles():
             all_member_roles[team_id].update(set(direct_member_roles.get(parent_team_id, [])))
 
     # Great! we should be done building all_member_roles which tells what roles gives team membership for all teams
-    # now at this point we save that data
-    for team in permission_registry.team_model.objects.prefetch_related('member_roles'):
+    # now at this point we save that data, optionally scoped to specific teams
+    if team_ids is not None:
+        team_ids = set(team_ids)
+        # Expand to include descendants in the team-of-team graph
+        team_team_children = defaultdict(set)
+        for child, parents in team_team_parents.items():
+            for parent in parents:
+                team_team_children[parent].add(child)
+        expanded = set(team_ids)
+        for tid in team_ids:
+            expanded.update(all_team_children(tid, team_team_children))
+        teams_qs = permission_registry.team_model.objects.filter(id__in=expanded)
+    else:
+        teams_qs = permission_registry.team_model.objects.all()
+
+    for team in teams_qs.prefetch_related('member_roles'):
         # NOTE: the .set method will not use the prefetched data, thus the messy implementation here
         existing_ids = set(r.id for r in team.member_roles.all())
         expected_ids = set(all_member_roles.get(team.id, []))
         to_add = expected_ids - existing_ids
         to_remove = existing_ids - expected_ids
         if to_add:
-            team.member_roles.add(*to_add)
+            _safe_m2m_add(team, to_add)
         if to_remove:
             team.member_roles.remove(*to_remove)
 
