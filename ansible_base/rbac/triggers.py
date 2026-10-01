@@ -19,6 +19,7 @@ from ansible_base.rbac.caching import (
     object_roles_for_parents,
     recompute_all_role_evaluations,
     recompute_role_evaluations,
+    recompute_role_evaluations_for_created,
     team_ids_from_role_target,
 )
 from ansible_base.rbac.models import ObjectRole, RoleDefinition, get_evaluation_model
@@ -321,7 +322,7 @@ def get_parent_ids(instance) -> list[tuple[Model, Union[int, UUID]]]:
     return []
 
 
-def post_save_update_obj_permissions(instance, object_pk=None, object_ct_id=None):
+def post_save_update_obj_permissions(instance, object_pk=None, object_ct_id=None, created=False):
     "Utility method shared by multiple signals"
     # Account for organization roles (and other parent objects), new and old
     parent_gfks = get_parent_ids(instance)
@@ -351,7 +352,13 @@ def post_save_update_obj_permissions(instance, object_pk=None, object_ct_id=None
         compute_team_member_roles(team_ids=[instance.id])
 
     if to_update:
-        recompute_role_evaluations(to_update, object_pk=object_pk, object_ct_id=object_ct_id)
+        target_parents = None
+        if object_pk is not None:
+            target_parents = [(parent_ct.id, parent_id) for parent_ct, parent_id in parent_gfks]
+        if created and object_pk is not None:
+            recompute_role_evaluations_for_created(to_update, object_pk=object_pk, object_ct_id=object_ct_id, target_parents=target_parents)
+        else:
+            recompute_role_evaluations(to_update, object_pk=object_pk, object_ct_id=object_ct_id, target_parents=target_parents)
 
 
 def rbac_pre_save_identify_changes(instance, *args, **kwargs):
@@ -368,6 +375,18 @@ def rbac_pre_save_identify_changes(instance, *args, **kwargs):
     # If we HAVE to do a query to find out if the parent field has changed then we will here
     if not hasattr(instance, '__rbac_original_parent_id') and instance.pk:
         instance.__rbac_original_parent_id = getattr(type(instance).objects.only('pk').get(pk=instance.pk), f'{parent_field_name}_id')
+
+
+def _moved_object_is_leaf(instance) -> bool:
+    """True if a parent change of this object affects only its own evaluations.
+
+    An object with registered child models (e.g. a namespace with collections) drags
+    its children along, and a team's move changes what its member role inherits, so
+    those need the full recompute of the old and new parent roles.
+    """
+    if instance._meta.model_name == permission_registry.team_model._meta.model_name:
+        return False
+    return not permission_registry.get_child_models(type(instance))
 
 
 def rbac_post_save_update_evaluations(instance, created, *args, **kwargs):
@@ -387,7 +406,7 @@ def rbac_post_save_update_evaluations(instance, created, *args, **kwargs):
         if defer_rbac_state.active:
             defer_rbac_state.created_instances.append((instance, instance.pk, obj_ct_id))
             return
-        post_save_update_obj_permissions(instance, object_pk=instance.pk, object_ct_id=obj_ct_id)
+        post_save_update_obj_permissions(instance, object_pk=instance.pk, object_ct_id=obj_ct_id, created=True)
         return
 
     # The parent object can not have changed if update_fields was given and did not list that field
@@ -399,7 +418,13 @@ def rbac_post_save_update_evaluations(instance, created, *args, **kwargs):
     current_parent_id = getattr(instance, f'{parent_field_name}_id')
     if hasattr(instance, '__rbac_original_parent_id') and instance.__rbac_original_parent_id != current_parent_id:
         logger.info(f'Object {instance} changed RBAC parent {instance.__rbac_original_parent_id}-->{current_parent_id}')
-        post_save_update_obj_permissions(instance)
+        if _moved_object_is_leaf(instance):
+            # Look ahead to this object only: roles on the old parent lose their rows for it,
+            # roles on the new parent gain them; nothing else about those roles changed.
+            obj_ct_id = permission_registry.content_type_model.objects.get_for_model(instance).id
+            post_save_update_obj_permissions(instance, object_pk=instance.pk, object_ct_id=obj_ct_id)
+        else:
+            post_save_update_obj_permissions(instance)
 
 
 def team_pre_delete(instance: Model, *args, **kwargs) -> None:
