@@ -322,24 +322,30 @@ def get_parent_ids(instance) -> list[tuple[Model, Union[int, UUID]]]:
     return []
 
 
+def _get_parent_gfks_for_update(instance):
+    parent_gfks = get_parent_ids(instance)
+    if not hasattr(instance, '__rbac_original_parent_id'):
+        return parent_gfks
+
+    parent_cls = permission_registry.get_parent_model(instance)
+    parent_ct = permission_registry.content_type_model.objects.get_for_model(parent_cls)
+    original_parent_id = instance.__rbac_original_parent_id
+    parent_gfks.append((parent_ct, original_parent_id))
+    if permission_registry.get_parent_fd_name(parent_cls):
+        # The old parent has parents of its own (e.g. a namespace's organization). Load it
+        # so that chain resolves; a bare parent_cls(pk=...) instance has no parent id and
+        # would silently drop the old grandparent's roles from the recompute.
+        parent_obj = parent_cls.objects.filter(pk=original_parent_id).first()
+        if parent_obj is not None:
+            parent_gfks += get_parent_ids(parent_obj)
+    delattr(instance, '__rbac_original_parent_id')
+    return parent_gfks
+
+
 def post_save_update_obj_permissions(instance, object_pk=None, object_ct_id=None, created=False):
     "Utility method shared by multiple signals"
     # Account for organization roles (and other parent objects), new and old
-    parent_gfks = get_parent_ids(instance)
-
-    if hasattr(instance, '__rbac_original_parent_id'):
-        parent_cls = permission_registry.get_parent_model(instance)
-        parent_ct = permission_registry.content_type_model.objects.get_for_model(parent_cls)
-        original_parent_id = instance.__rbac_original_parent_id
-        parent_gfks.append((parent_ct, original_parent_id))
-        if permission_registry.get_parent_fd_name(parent_cls):
-            # The old parent has parents of its own (e.g. a namespace's organization). Load it
-            # so that chain resolves; a bare parent_cls(pk=...) instance has no parent id and
-            # would silently drop the old grandparent's roles from the recompute.
-            parent_obj = parent_cls.objects.filter(pk=original_parent_id).first()
-            if parent_obj is not None:
-                parent_gfks += get_parent_ids(parent_obj)
-        delattr(instance, '__rbac_original_parent_id')
+    parent_gfks = _get_parent_gfks_for_update(instance)
 
     if parent_gfks:
         to_update = object_roles_for_parents(set(parent_gfks))
